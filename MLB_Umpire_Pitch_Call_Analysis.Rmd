@@ -1,0 +1,492 @@
+---
+title: "MLB Umpire Pitch-Call Analysis"
+author: "Ty Curtis"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Overview
+
+This project analyzes MLB umpire accuracy on called balls and strikes using pitch-level Statcast data. The analysis first examines the 2025 MLB season and then expands across the 2015–2025 regular seasons to evaluate changes in missed-call rates over time and identify teams most affected by incorrect ball/strike calls.
+
+## Setup
+
+```{r}
+library(baseballr)
+library(tidyverse)
+```
+
+# 2025 MLB Season
+
+## Collect Statcast Data
+
+Statcast data are collected one day at a time for the 2025 MLB season and combined into a single dataset. The resulting data are cached locally so the full dataset does not need to be downloaded repeatedly.
+
+```{r}
+dates_2025 <- seq.Date(
+  as.Date("2025-03-27"),
+  as.Date("2025-09-28"),
+  by = "day"
+)
+
+pull_one_day <- function(date) {
+  message("Pulling: ", date)
+  
+  url <- paste0(
+    "https://baseballsavant.mlb.com/statcast_search/csv?",
+    "all=true&hfGT=R%7CPO%7CS%7C&hfSea=2025%7C",
+    "&player_type=pitcher",
+    "&game_date_gt=", date,
+    "&game_date_lt=", date,
+    "&min_pitches=0&min_results=0",
+    "&group_by=name",
+    "&sort_col=pitches",
+    "&player_event_sort=h_launch_speed",
+    "&sort_order=desc",
+    "&min_abs=0",
+    "&type=details"
+  )
+  
+  tryCatch(
+    read_csv(url, show_col_types = FALSE, col_types = cols(.default = col_character())) %>%
+      mutate(source_date = as.character(date)),
+    error = function(e) {
+      message("FAILED: ", date)
+      tibble()
+    }
+  )
+}
+
+statcast_2025 <- map_dfr(dates_2025, pull_one_day)
+
+saveRDS(statcast_2025, "statcast_2025_raw.rds")
+```
+
+## Classify Called Pitches
+
+Only pitches recorded as called strikes or balls are retained. Pitch location and the batter-specific vertical strike-zone boundaries are used to classify whether each pitch was actually inside the strike zone.
+
+That classification is then compared with the umpire's recorded call.
+
+```{r}
+called_2025 <- statcast_2025 %>%
+  filter(description %in% c("called_strike", "ball")) %>%
+  mutate(
+    plate_x = as.numeric(plate_x),
+    plate_z = as.numeric(plate_z),
+    sz_top = as.numeric(sz_top),
+    sz_bot = as.numeric(sz_bot),
+    
+    actual_strike = plate_x >= -0.83 & plate_x <= 0.83 &
+      plate_z >= sz_bot & plate_z <= sz_top,
+    
+    umpire_called_strike = description == "called_strike",
+    correct_call = actual_strike == umpire_called_strike
+  )
+
+called_2025 %>%
+  summarise(
+    total_called_pitches = n(),
+    missed_calls = sum(!correct_call, na.rm = TRUE),
+    miss_rate = mean(!correct_call, na.rm = TRUE)
+  )
+```
+
+## Determine Which Team Was Harmed
+
+Incorrect calls are separated into strikes called balls and balls called strikes. The batting and fielding teams are then used to identify which team was negatively affected by each missed call.
+
+```{r}
+called_2025_clean <- called_2025 %>%
+  mutate(
+    batting_team = if_else(inning_topbot == "Top", away_team, home_team),
+    fielding_team = if_else(inning_topbot == "Top", home_team, away_team),
+
+    miss_type = case_when(
+      actual_strike == TRUE  & umpire_called_strike == FALSE ~ "Missed strike called ball",
+      actual_strike == FALSE & umpire_called_strike == TRUE  ~ "Missed ball called strike",
+      TRUE ~ "Correct"
+    ),
+
+    team_harmed = case_when(
+      miss_type == "Missed strike called ball" ~ fielding_team,
+      miss_type == "Missed ball called strike" ~ batting_team,
+      TRUE ~ NA_character_
+    )
+  )
+```
+
+## Teams Most Affected by Missed Calls
+
+```{r}
+team_unlucky <- called_2025_clean %>%
+  filter(!correct_call) %>%
+  count(team_harmed, sort = TRUE) %>%
+  mutate(missed_calls_against_per_100 = n / sum(n) * 100)
+
+team_unlucky
+```
+
+```{r}
+team_unlucky %>%
+  slice_max(n, n = 15) %>%
+  ggplot(aes(x = reorder(team_harmed, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Most Unlucky MLB Teams by Missed Ball/Strike Calls Against Them",
+    x = "Team Harmed",
+    y = "Missed Calls Against"
+  )
+```
+
+## Called Pitches by Umpire
+
+```{r}
+called_2025_clean %>%
+  count(umpire, sort = TRUE)
+```
+
+## 2025 Umpire Miss Rate
+
+The overall miss rate is expressed as the number of incorrect ball/strike calls per 100 called pitches.
+
+```{r}
+summary_df <- tibble(
+  metric = "Missed Calls per 100",
+  value = 100 * mean(!called_2025$correct_call, na.rm = TRUE)
+)
+
+ggplot(summary_df, aes(x = metric, y = value)) +
+  geom_col(width = 0.5) +
+  geom_text(
+    aes(label = round(value, 2)),
+    vjust = -0.5,
+    size = 8
+  ) +
+  labs(
+    title = "MLB Umpire Miss Rate (2025)",
+    subtitle = "Missed Ball/Strike Calls per 100 Called Pitches",
+    x = NULL,
+    y = "Missed Calls per 100"
+  ) +
+  ylim(0, 10)
+```
+
+## Overall Called-Pitch Accuracy
+
+```{r}
+called_2025 %>%
+  count(correct_call) %>%
+  mutate(
+    pct = n / sum(n)
+  ) %>%
+  ggplot(aes(
+    x = "",
+    y = pct,
+    fill = correct_call
+  )) +
+  geom_col(width = 1) +
+  coord_polar(theta = "y") +
+  geom_text(
+    aes(label = scales::percent(pct)),
+    position = position_stack(vjust = 0.5)
+  ) +
+  labs(
+    title = "MLB Umpire Accuracy on Called Pitches (2025)"
+  )
+```
+
+## Average Missed Calls per Game
+
+```{r}
+missed_per_game <- called_2025 %>%
+  filter(!is.na(game_pk), !is.na(correct_call)) %>%
+  group_by(game_pk) %>%
+  summarise(
+    missed_calls = sum(!correct_call),
+    .groups = "drop"
+  )
+
+avg_missed_per_game <- mean(missed_per_game$missed_calls)
+
+avg_missed_per_game
+```
+
+```{r}
+missed_per_game %>%
+  ggplot(aes(x = missed_calls)) +
+  geom_histogram(binwidth = 1, boundary = 0) +
+  geom_vline(xintercept = avg_missed_per_game, linetype = "dashed", linewidth = 1) +
+  annotate(
+    "text",
+    x = avg_missed_per_game,
+    y = Inf,
+    label = paste0("Average = ", round(avg_missed_per_game, 2), " missed calls/game"),
+    vjust = 2,
+    hjust = -0.05
+  ) +
+  labs(
+    title = "Missed Ball/Strike Calls per Game",
+    subtitle = "2025 MLB season",
+    x = "Missed Calls in Game",
+    y = "Number of Games"
+  )
+```
+
+# MLB Umpire Accuracy: 2015–2025
+
+The analysis is expanded to the 2015–2025 MLB regular seasons to examine whether ball/strike accuracy has changed over time.
+
+## Collect Multi-Season Statcast Data
+
+```{r}
+library(tidyverse)
+
+years_to_pull <- 2015:2025
+
+pull_one_day <- function(date, year) {
+  message("Pulling: ", date)
+  
+  url <- paste0(
+    "https://baseballsavant.mlb.com/statcast_search/csv?",
+    "all=true",
+    "&hfGT=R%7C",
+    "&hfSea=", year, "%7C",
+    "&player_type=pitcher",
+    "&game_date_gt=", date,
+    "&game_date_lt=", date,
+    "&min_pitches=0",
+    "&min_results=0",
+    "&group_by=name",
+    "&sort_col=pitches",
+    "&player_event_sort=h_launch_speed",
+    "&sort_order=desc",
+    "&min_abs=0",
+    "&type=details"
+  )
+  
+  tryCatch(
+    read_csv(url, show_col_types = FALSE, col_types = cols(.default = col_character())) %>%
+      select(any_of(c(
+        "game_date", "game_year", "game_pk",
+        "description", "plate_x", "plate_z", "sz_top", "sz_bot",
+        "inning_topbot", "home_team", "away_team"
+      ))) %>%
+      mutate(source_date = as.character(date), year = year),
+    error = function(e) {
+      message("FAILED: ", date)
+      tibble()
+    }
+  )
+}
+
+pull_one_year <- function(year) {
+  file_name <- paste0("statcast_", year, "_called_raw.rds")
+  
+  if (file.exists(file_name)) {
+    message("Loading cached ", year)
+    return(readRDS(file_name))
+  }
+  
+  dates <- seq.Date(
+    as.Date(paste0(year, "-03-01")),
+    as.Date(paste0(year, "-11-15")),
+    by = "day"
+  )
+  
+  year_data <- map_dfr(dates, ~pull_one_day(.x, year))
+  saveRDS(year_data, file_name)
+  year_data
+}
+
+statcast_all <- map_dfr(years_to_pull, pull_one_year)
+
+saveRDS(statcast_all, "statcast_2015_2025_raw.rds")
+```
+
+## Clean and Classify Called Pitches
+
+The same strike-zone classification used for the 2025 analysis is applied consistently across all seasons.
+
+```{r}
+called_all <- statcast_all %>%
+  filter(description %in% c("called_strike", "ball")) %>%
+  mutate(
+    year = as.integer(year),
+    game_pk = as.character(game_pk),
+    plate_x = as.numeric(plate_x),
+    plate_z = as.numeric(plate_z),
+    sz_top = as.numeric(sz_top),
+    sz_bot = as.numeric(sz_bot),
+    
+    actual_strike = plate_x >= -0.83 & plate_x <= 0.83 &
+      plate_z >= sz_bot & plate_z <= sz_top,
+    
+    umpire_called_strike = description == "called_strike",
+    correct_call = actual_strike == umpire_called_strike,
+    
+    batting_team = if_else(inning_topbot == "Top", away_team, home_team),
+    fielding_team = if_else(inning_topbot == "Top", home_team, away_team),
+    
+    miss_type = case_when(
+      actual_strike == TRUE  & umpire_called_strike == FALSE ~ "Strike called ball",
+      actual_strike == FALSE & umpire_called_strike == TRUE  ~ "Ball called strike",
+      TRUE ~ "Correct"
+    ),
+    
+    team_harmed = case_when(
+      miss_type == "Strike called ball" ~ fielding_team,
+      miss_type == "Ball called strike" ~ batting_team,
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(correct_call))
+
+saveRDS(called_all, "called_pitches_2015_2025_clean.rds")
+```
+
+# Results
+
+## Missed Calls per 100 Called Pitches
+
+The first comparison measures the number of missed ball/strike calls per 100 called pitches for each MLB season.
+
+```{r}
+year_summary <- called_all %>%
+  group_by(year) %>%
+  summarise(
+    total_called_pitches = n(),
+    missed_calls = sum(!correct_call),
+    missed_per_100 = 100 * missed_calls / total_called_pitches,
+    .groups = "drop"
+  )
+
+year_summary
+```
+
+```{r}
+ggplot(year_summary, aes(x = year, y = missed_per_100)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_text(
+    aes(label = round(missed_per_100, 2)),
+    vjust = -0.7,
+    size = 3.5
+  ) +
+  labs(
+    title = "MLB Umpire Miss Rate by Season",
+    subtitle = "Missed ball/strike calls per 100 called pitches",
+    x = "Season",
+    y = "Missed Calls per 100"
+  )
+```
+
+## Average Missed Calls per Game
+
+The second comparison measures how many incorrect ball/strike calls occurred in the average MLB game during each season.
+
+```{r}
+missed_per_game_year <- called_all %>%
+  group_by(year, game_pk) %>%
+  summarise(
+    missed_calls = sum(!correct_call),
+    .groups = "drop"
+  ) %>%
+  group_by(year) %>%
+  summarise(
+    games = n(),
+    avg_missed_calls_per_game = mean(missed_calls),
+    .groups = "drop"
+  )
+
+missed_per_game_year
+```
+
+```{r}
+ggplot(missed_per_game_year, aes(x = year, y = avg_missed_calls_per_game)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  geom_text(
+    aes(label = round(avg_missed_calls_per_game, 2)),
+    vjust = -0.7,
+    size = 3.5
+  ) +
+  labs(
+    title = "Average Missed Ball/Strike Calls per Game by Season",
+    subtitle = "MLB regular seasons, 2015–2025",
+    x = "Season",
+    y = "Average Missed Calls per Game"
+  )
+```
+
+## Teams Most Affected by Missed Calls
+
+Finally, missed calls are attributed to the team harmed by the decision. Teams are ranked within each season according to the total number of incorrect ball/strike calls against them.
+
+```{r}
+team_unlucky_by_year <- called_all %>%
+  filter(!correct_call, !is.na(team_harmed)) %>%
+  group_by(year, team_harmed) %>%
+  summarise(
+    missed_calls_against = n(),
+    .groups = "drop"
+  ) %>%
+  group_by(year) %>%
+  mutate(rank = min_rank(desc(missed_calls_against))) %>%
+  ungroup()
+
+team_unlucky_by_year
+```
+
+```{r}
+team_unlucky_by_year %>%
+  filter(rank <= 5) %>%
+  ggplot(aes(
+    x = reorder(team_harmed, missed_calls_against),
+    y = missed_calls_against
+  )) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~ year, scales = "free_y") +
+  labs(
+    title = "Most Unlucky MLB Teams by Season",
+    subtitle = "Teams with the most missed ball/strike calls against them",
+    x = "Team Harmed",
+    y = "Missed Calls Against"
+  )
+```
+
+## Most Affected Team by Season
+
+```{r}
+team_unlucky_by_year %>%
+  filter(rank == 1) %>%
+  arrange(year)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
